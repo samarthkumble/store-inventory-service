@@ -3,6 +3,8 @@
 The same code runs on your laptop, in Docker and in GitHub Actions;
 only the environment changes. This is the "12-factor app" config rule.
 """
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +14,10 @@ class Settings(BaseSettings):
     # Required: the app refuses to start if DATABASE_URL is missing,
     # instead of failing later on the first query.
     database_url: str
+
+    # How POST /orders reserves stock. Both options are correct under
+    # concurrency; see app/services/reservation.py for the trade-offs.
+    reservation_strategy: Literal["atomic", "for_update"] = "atomic"
 
 
 settings = Settings()

@@ -7,22 +7,28 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError, OutOfStockError
 from app.db.session import SessionLocal
-from app.routers import products, stores
+from app.routers import orders, products, stores
 
 app = FastAPI(
     title="Store Inventory & Replenishment Service",
-    version="0.1.0",
-    description="Per-store stock, shelf locations and product search for a home-improvement retailer.",
+    version="0.2.0",
+    description=(
+        "Per-store stock, shelf locations, product search and "
+        "oversell-safe order reservations for a home-improvement retailer."
+    ),
 )
 
 app.include_router(products.router)
 app.include_router(stores.router)
+app.include_router(orders.router)
 
 
 # One place maps business errors to HTTP status codes. Services never import
 # FastAPI, and every endpoint answers errors in the same {"detail": ...} shape.
+# FastAPI picks the most specific handler, so OutOfStockError uses its own
+# handler even though it is also a ConflictError.
 @app.exception_handler(NotFoundError)
 def handle_not_found(request: Request, exc: NotFoundError) -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": str(exc)})
@@ -31,6 +37,21 @@ def handle_not_found(request: Request, exc: NotFoundError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def handle_conflict(request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+
+@app.exception_handler(OutOfStockError)
+def handle_out_of_stock(request: Request, exc: OutOfStockError) -> JSONResponse:
+    # Machine-readable fields, so a client can say "only 3 left" without
+    # parsing the message text.
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": str(exc),
+            "sku": exc.sku,
+            "requested": exc.requested,
+            "available": exc.available,
+        },
+    )
 
 
 @app.get("/health", tags=["health"])
