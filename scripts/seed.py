@@ -204,7 +204,7 @@ def main() -> int:
         if args.reset:
             # RESTART IDENTITY resets the stores id sequence, so ids start at 1 again.
             db.execute(text(
-                "TRUNCATE order_items, orders, stock, products, stores RESTART IDENTITY"
+                "TRUNCATE order_items, orders, stock, products, stores, outbox RESTART IDENTITY"
             ))
         elif db.scalar(select(func.count()).select_from(Product)):
             print("Database already has products. Use --reset to wipe and reseed.")

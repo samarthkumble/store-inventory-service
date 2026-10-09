@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.schemas.product import SKU_PATTERN, Category
-from app.schemas.stock import ProductSearchResult, StockOut, StoreOut
+from app.schemas.stock import ProductSearchResult, StockOut, StockReceive, StoreOut
 from app.services import stock_service
 
 router = APIRouter(prefix="/stores", tags=["stores"])
@@ -27,6 +27,17 @@ def get_stock(
 ):
     """On-hand, reserved and available (= on_hand - reserved) for one SKU, plus its shelf location."""
     return stock_service.get_stock(db, store_id, sku)
+
+
+@router.post("/{store_id}/stock/{sku}/receive", response_model=StockOut)
+def receive_stock(
+    store_id: int,
+    sku: Annotated[str, Path(pattern=SKU_PATTERN, examples=["PLB-00024"])],
+    data: StockReceive,
+    db: DbSession,
+):
+    """Record a delivery: on_hand += qty. Emits a RECEIVED StockChanged event."""
+    return stock_service.receive_stock(db, store_id, sku, data.qty)
 
 
 @router.get("/{store_id}/products", response_model=list[ProductSearchResult])

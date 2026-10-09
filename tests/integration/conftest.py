@@ -12,6 +12,7 @@ import time
 from decimal import Decimal
 
 import pytest
+import redis
 import uvicorn
 from alembic import command
 from alembic.config import Config
@@ -21,9 +22,13 @@ from sqlalchemy import create_engine, insert, make_url, select, text
 from app.db.session import SessionLocal, engine
 from app.main import app
 from app.models import Product, Stock, Store
-from tests.conftest import TEST_DATABASE_URL
+from replenishment.db import init_db as init_replenishment_db
+from replenishment.main import app as replenishment_app
+from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL
 
-TABLES = "order_items, orders, stock, products, stores"
+TABLES = ("order_items, orders, stock, products, stores, outbox, "
+          "replenishment.stock_levels, replenishment.daily_demand, "
+          "replenishment.processed_events")
 
 
 def _create_test_database() -> None:
@@ -49,16 +54,33 @@ def test_database():
     """
     _create_test_database()
     command.upgrade(Config("alembic.ini"), "head")
+    init_replenishment_db()
     yield
     engine.dispose()
 
 
+@pytest.fixture
+def redis_client():
+    client = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    yield client
+    client.close()
+
+
 @pytest.fixture(autouse=True)
-def clean_db(test_database):
-    """Before every test: empty tables, so tests can't affect each other."""
+def clean_db(test_database, redis_client):
+    """Before every test: empty tables AND the test Redis database, so tests
+    can't affect each other (a cached product from an earlier test would
+    otherwise survive the TRUNCATE)."""
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE {TABLES} RESTART IDENTITY"))
+    redis_client.flushdb()
     yield
+
+
+@pytest.fixture
+def replenishment_client():
+    with TestClient(replenishment_app) as c:
+        yield c
 
 
 @pytest.fixture

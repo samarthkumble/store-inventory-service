@@ -2,9 +2,12 @@
 
 [![CI](https://github.com/samarthkumble/store-inventory-service/actions/workflows/ci.yml/badge.svg)](https://github.com/samarthkumble/store-inventory-service/actions/workflows/ci.yml)
 
-A REST microservice for a home-improvement retailer's store inventory: per-store stock levels, shelf locations (aisle and bay), ranked product search, and order reservations that **cannot oversell, even under heavy concurrent load**.
+Two REST microservices for a home-improvement retailer's store inventory:
 
-Built with Python 3.12, FastAPI, PostgreSQL 17, SQLAlchemy 2.0, Alembic, Pydantic, pytest, Docker Compose and GitHub Actions.
+- **Inventory service:** per-store stock levels, shelf locations (aisle and bay), ranked product search, and order reservations that **cannot oversell, even under heavy concurrent load**.
+- **Replenishment service:** consumes `StockChanged` events and suggests reorders from a 7-day moving average of demand.
+
+Built with Python 3.12, FastAPI, PostgreSQL 17, SQLAlchemy 2.0, Alembic, Pydantic, Redis Streams, pytest, Docker Compose and GitHub Actions.
 
 ## The problem
 
@@ -16,18 +19,23 @@ This service makes the check and the write a single atomic step, and proves it w
 
 ```mermaid
 flowchart LR
-    client["Client<br/>(app, POS, /docs)"] -->|HTTP JSON| routers
+    client["Client<br/>(app, POS, /docs)"] -->|HTTP JSON| api
 
-    subgraph api["FastAPI service (Docker container)"]
-        routers["Routers<br/>HTTP only: parse, validate, respond"]
-        services["Services<br/>business rules + all SQL"]
-        errors["Error handlers<br/>NotFound → 404, Conflict → 409"]
-        routers --> services
-        services -. domain errors .-> errors
+    subgraph inv["Inventory service :8000"]
+        api["FastAPI<br/>routers → services"]
     end
 
-    services -->|"SQLAlchemy 2.0 + psycopg 3<br/>connection pool"| db[("PostgreSQL 17<br/>CHECK constraints, row locks,<br/>GIN full-text index")]
-    alembic["Alembic migrations"] -->|"run at container start"| db
+    api -->|"one transaction:<br/>stock change + outbox row"| db[("PostgreSQL 17<br/>stock, orders, outbox")]
+    api <-->|"cache-aside<br/>product lookups"| redis[("Redis")]
+    relay["Outbox relay"] -->|"poll unpublished rows<br/>(SKIP LOCKED)"| db
+    relay -->|"XADD StockChanged"| stream[["Redis Stream<br/>stock-events"]]
+    stream -->|"XREADGROUP<br/>consumer group"| consumer["Replenishment consumer<br/>idempotent by event_id"]
+    consumer --> rdb[("replenishment schema<br/>stock levels, daily demand")]
+
+    subgraph rep["Replenishment service :8001"]
+        rapi["GET /reorder-suggestions"]
+    end
+    rapi --> rdb
 ```
 
 Order lifecycle (every transition is a conditional `UPDATE ... WHERE status = 'RESERVED'`, so a double-click can't apply it twice):
@@ -46,11 +54,22 @@ stateDiagram-v2
 Requires Docker Desktop.
 
 ```bash
-docker compose up -d --build --wait                      # Postgres + API, waits until both are healthy
+docker compose up -d --build --wait                      # 6 containers, waits until all are healthy
 docker compose exec api python -m scripts.seed --reset   # 3 stores, 200 products, 561 stock rows
 ```
 
-Open **http://localhost:8000/docs** for interactive API docs.
+Interactive API docs: **http://localhost:8000/docs** (inventory) and **http://localhost:8001/docs** (replenishment).
+
+| Container | Role |
+|---|---|
+| `inventory-db` | PostgreSQL 17 |
+| `inventory-redis` | Redis 7: event stream and product cache |
+| `inventory-api` | Inventory service (runs migrations at start) |
+| `inventory-outbox-relay` | Publishes outbox rows to the `stock-events` stream |
+| `replenishment-api` | Replenishment service |
+| `replenishment-consumer` | Reads the stream, updates demand and stock levels |
+
+See the event pipeline work, timed: `python -m scripts.demo_events`.
 
 ### Run the tests
 
@@ -58,11 +77,11 @@ Open **http://localhost:8000/docs** for interactive API docs.
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
 pip install -r requirements-dev.txt
-docker compose up -d db
+docker compose up -d db redis
 pytest --cov
 ```
 
-Tests create and migrate their own `inventory_test` database, so development data is never touched.
+Tests create and migrate their own `inventory_test` database and use Redis database 15, so development data is never touched.
 
 ## API
 
@@ -71,14 +90,16 @@ Tests create and migrate their own `inventory_test` database, so development dat
 | `GET` | `/stores` | List stores |
 | `GET` | `/stores/{store_id}/products?q=&category=` | Full-text product search in one store, most relevant first, with availability, aisle and bay |
 | `GET` | `/stores/{store_id}/stock/{sku}` | `on_hand`, `reserved`, `available` (= on_hand − reserved) and location |
+| `POST` | `/stores/{store_id}/stock/{sku}/receive` | Record a delivery: `on_hand += qty` |
 | `POST` | `/products` | Create a product (409 if the SKU exists) |
-| `GET` / `PATCH` / `DELETE` | `/products/{sku}` | Read, partially update, soft-delete |
+| `GET` / `PATCH` / `DELETE` | `/products/{sku}` | Read (Redis-cached, `X-Cache: HIT/MISS`), partially update, soft-delete |
 | `GET` | `/products?category=` | List the catalogue (paginated) |
 | `POST` | `/orders` | Reserve stock for one or more items, all or nothing (409 if any item is short) |
 | `GET` | `/orders/{id}` | Order with line items and total |
 | `POST` | `/orders/{id}/confirm` | Sold: units leave the shelf |
 | `POST` | `/orders/{id}/cancel` | Released: units become available again |
 | `GET` | `/health` | Liveness plus a database round trip |
+| `GET` | `:8001/reorder-suggestions?store_id=` | Replenishment: SKUs below `avg daily demand × lead time + safety stock`, most urgent first |
 
 ### Examples
 
@@ -126,6 +147,18 @@ If any item is short, nothing is reserved and the response says exactly why:
 - **Order lines snapshot `unit_price`**, so later price changes don't rewrite history.
 - **Soft delete** for products, because old orders still reference them. UUID order IDs, so IDs in URLs can't be guessed.
 
+**Events and replenishment**
+- **Transactional outbox instead of a dual write.** Committing to Postgres and then publishing to Redis is two systems: a crash in between loses the event, and publishing first can announce a change that then rolls back. Each stock change instead inserts its `StockChanged` event into an `outbox` table in the same transaction. A test proves a failed order leaves no events.
+- **Relay with at-least-once delivery.** A separate process publishes unpublished outbox rows in id order, then marks them. `FOR UPDATE SKIP LOCKED` lets two relays run without double-publishing, and a partial index keeps the "unpublished" lookup small.
+- **Idempotent consumer.** The consumer inserts each `event_id` into `processed_events` in the same transaction as its effect, then acknowledges the message. A redelivered event is skipped, so at-least-once delivery has an effectively-once effect. An older event can't overwrite a newer stock level, and a failing event stays pending for retry without blocking the others.
+- **Database per service (schema per service here).** The replenishment service never queries inventory tables. Events carry the post-change stock levels, so it keeps working even when the inventory service is down.
+- **Reorder rule:** `available < avg_daily_demand × lead_time_days (3) + safety_stock (5)`, with a 7-day moving average where days without sales count as zero, on the store's local calendar day (Asia/Kolkata), not UTC. The suggested quantity covers the reorder level plus one more window of demand.
+- **Mapping to Kafka:** the stream is a topic, a `(store_id, sku)` partition key keeps each SKU's events ordered, a consumer group is a Kafka consumer group, XACK is a committed offset, and stream `MAXLEN` corresponds to topic retention.
+
+**Caching**
+- **Cache-aside for product lookups**, with a 5-minute TTL as a safety net. The cache entry is deleted after the database commit, never before, so a concurrent read can't refill it with the old row.
+- **The cache is optional.** Redis errors behave like a cache miss. A test found that redis-py's default retries made every request over 12 s slower while Redis was down, so retries are off for the cache and a test now checks that requests stay fast.
+
 **Search**
 - **Postgres full-text search with a GIN index.** It replaced `ILIKE '%tap%'`, which returned 14 results for "tap", 7 of them tape. Stemming means "taps" finds taps. `websearch_to_tsquery` supports `pillar tap -steel`. A test checks with `EXPLAIN` that the index is used.
 
@@ -134,13 +167,15 @@ If any item is short, nothing is reserved and the response says exactly why:
 - **Hand-written Alembic migrations**, with `alembic check` in CI to prove they match the models.
 - **Tests run on real Postgres, never SQLite.** SQLite serialises writers, which would hide the concurrency bugs.
 - **Docker:** dependencies are installed before the code is copied (layer caching), the container runs as a non-root user, and `exec uvicorn` gives a graceful shutdown.
-- **CI:** migrations, `alembic check`, tests with a 90% coverage gate, then the image is built and the running stack is smoke-tested.
+- **CI:** migrations, `alembic check`, tests with a 90% coverage gate, then the image is built, all 6 containers start, and a smoke test checks that a reservation reaches the replenishment service through the event pipeline.
 
 ## Results
 
-All numbers below were measured on a Windows 11 laptop. The API ran in Docker Desktop (WSL 2) as a single uvicorn process, and the load came from a client on the same machine.
+All numbers below were measured on a Windows 11 laptop. The full stack (6 containers) ran in Docker Desktop (WSL 2), with a single uvicorn process per API and the load coming from a client on the same machine.
 
-**Tests:** 74 passing (27 unit tests that need no database, 47 integration tests against Postgres). Coverage is 98.97% of lines and branches in `app/` and `scripts/` (excluding the manual `bench.py` tool). CI fails below 90%.
+**Tests:** 96 passing, all against real Postgres and Redis except the unit tests. Coverage is 94.22% of lines and branches. The manual `bench.py` and `demo_events.py` tools are excluded. CI fails below 90%.
+
+**Event pipeline:** after a sale is confirmed, the reorder suggestion appeared in the replenishment API 435 ms later. After a delivery was received, it cleared 461 ms later. That covers API commit → outbox → relay → Redis Stream → consumer → suggestion (`python -m scripts.demo_events`).
 
 **Overselling test:** 50 simultaneous `POST /orders` for the last 10 units of one SKU.
 
@@ -156,12 +191,12 @@ All numbers below were measured on a Windows 11 laptop. The API ran in Docker De
 
 | Endpoint | Median | p95 | p99 |
 |---|---|---|---|
-| `GET /health` | 11.4 ms | 13.9 ms | 16.2 ms |
-| `GET /stores/1/stock/PLB-00024` | 19.8 ms | 23.7 ms | 27.9 ms |
-| `GET /stores/1/products?q=tap` | 26.0 ms | 31.3 ms | 36.9 ms |
-| `POST /orders` (1 item) | 28.0 ms | 34.0 ms | 37.9 ms |
+| `GET /health` | 10.7 ms | 13.4 ms | 16.2 ms |
+| `GET /stores/1/stock/PLB-00024` | 19.1 ms | 26.7 ms | 37.2 ms |
+| `GET /stores/1/products?q=tap` | 32.7 ms | 75.6 ms | 110.3 ms |
+| `POST /orders` (1 item, writes the outbox event too) | 26.5 ms | 55.8 ms | 94.5 ms |
 
-**Throughput:** 20 concurrent clients, 1,000 search requests, 75 requests/s, median 256 ms, p95 368 ms, 0 errors.
+**Throughput:** 20 concurrent clients, 1,000 search requests, 57 requests/s, median 330 ms, p95 522 ms, 0 errors.
 
 Reproduce these with `python -m scripts.bench` against the running stack.
 
@@ -170,18 +205,21 @@ Reproduce these with `python -m scripts.bench` against the running stack.
 ```
 app/
   core/        settings (env vars) and domain errors
+  events/      outbox writer and the relay process
+  cache.py     Redis cache-aside helpers (fail-open)
   db/          SQLAlchemy base (naming conventions) and sessions
   models/      tables: stores, products, stock, orders, order_items
   schemas/     Pydantic request and response contracts
   services/    business logic: catalogue, stock/search, reservations, orders
   routers/     HTTP endpoints
-alembic/       migrations (0001 schema, 0002 full-text index)
-scripts/       seed.py (deterministic data), bench.py (latency/throughput)
+replenishment/ second service: consumer, moving-average suggestions, API
+alembic/       migrations (0001 schema, 0002 full-text index, 0003 outbox)
+scripts/       seed.py (deterministic data), bench.py (latency/throughput), demo_events.py
 tests/
   unit/        no database needed
-  integration/ real Postgres: API, services, concurrency, seed script
+  integration/ real Postgres + Redis: API, concurrency, events, replenishment, cache
 ```
 
 ## Possible next steps
 
-Not built yet: a replenishment service consuming `StockChanged` events (Redis Streams, mapping to Kafka topics and consumer groups) to suggest reorders from moving-average demand; caching of hot product lookups; an AI product finder that validates model output against the catalogue; prefix and typo-tolerant search (`pg_trgm`).
+Not built yet: a dead-letter stream for events that keep failing; Kafka in place of Redis Streams at higher volume; per-SKU lead times and safety stock instead of global settings; an AI product finder that validates model output against the catalogue; prefix and typo-tolerant search (`pg_trgm`).

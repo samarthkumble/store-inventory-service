@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StoreOut(BaseModel):
@@ -41,3 +43,11 @@ class ProductSearchResult(BaseModel):
     available: int
     aisle: str
     bay: str
+
+
+class StockReceive(BaseModel):
+    """A delivery from a supplier or distribution centre."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    qty: Annotated[int, Field(gt=0, le=10_000)]

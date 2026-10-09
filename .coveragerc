@@ -1,10 +1,10 @@
 [run]
-source = app, scripts
+source = app, scripts, replenishment
 # Also measure which if/else branches ran, not just which lines.
 branch = True
-# bench.py is a manual measurement tool that needs a running server,
-# not product code, so it isn't part of the coverage target.
-omit = scripts/bench.py
+# bench.py and demo_events.py are manual tools that need a running stack,
+# not product code, so they are not part of the coverage target.
+omit = scripts/bench.py, scripts/demo_events.py
 
 [report]
 show_missing = True

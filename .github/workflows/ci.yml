@@ -8,7 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A real Postgres for the tests, same version as docker-compose.yml.
+    # Real Postgres and Redis for the tests, same versions as docker-compose.yml.
     services:
       postgres:
         image: postgres:17-alpine
@@ -23,13 +23,23 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql+psycopg://inventory:inventory@localhost:5432/inventory
       TEST_DATABASE_URL: postgresql+psycopg://inventory:inventory@localhost:5432/inventory_test
+      TEST_REDIS_URL: redis://localhost:6379/15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip                      # reuse downloads between runs
@@ -51,17 +61,33 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Build and start the full stack
-        # --wait blocks until both healthchecks pass (or fails the job).
+      - name: Build and start the full stack (6 containers)
+        # --wait blocks until every healthcheck passes (or fails the job).
         run: docker compose up -d --build --wait
 
-      - name: Smoke test the running API
+      - name: Smoke test the inventory API
         run: |
           curl --fail --silent http://localhost:8000/health
-          docker compose exec -T api python -m scripts.seed
+          docker compose exec -T api python -m scripts.seed --reset
           curl --fail --silent "http://localhost:8000/stores/1/products?q=tap"
+
+      - name: Smoke test the event pipeline end to end
+        # PLB-00027 has 3 units at store 1 in the seed data, below the safety
+        # stock of 5. Reserving 1 emits an event; within seconds the
+        # replenishment service must suggest a reorder for it.
+        run: |
+          curl --fail --silent -X POST http://localhost:8000/orders \
+            -H "Content-Type: application/json" \
+            -d '{"store_id": 1, "items": [{"sku": "PLB-00027", "qty": 1}]}'
+          for i in $(seq 1 30); do
+            if curl --fail --silent "http://localhost:8001/reorder-suggestions?store_id=1" | grep -q PLB-00027; then
+              echo "event arrived after ~$((i / 2)) s"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "reorder suggestion never appeared"; exit 1
 
       - name: Show logs if anything failed
         if: failure()

@@ -22,7 +22,8 @@ from app.core.exceptions import NotFoundError, OutOfStockError
 from app.models import Stock
 
 # A strategy takes (db, store_id, sku, qty) and either reserves or raises.
-ReserveFn = Callable[[Session, int, str, int], None]
+# It returns (on_hand, reserved) after the change, for the StockChanged event.
+ReserveFn = Callable[[Session, int, str, int], tuple[int, int]]
 
 
 def _raise_unavailable(db: Session, store_id: int, sku: str, qty: int) -> None:
@@ -39,7 +40,7 @@ def _raise_unavailable(db: Session, store_id: int, sku: str, qty: int) -> None:
     raise OutOfStockError(store_id, sku, qty, row.on_hand - row.reserved)
 
 
-def reserve_atomic(db: Session, store_id: int, sku: str, qty: int) -> None:
+def reserve_atomic(db: Session, store_id: int, sku: str, qty: int) -> tuple[int, int]:
     """Check and update in ONE statement. This is the default.
 
     UPDATE stock SET reserved = reserved + :qty
@@ -53,7 +54,7 @@ def reserve_atomic(db: Session, store_id: int, sku: str, qty: int) -> None:
     between them. If the condition is false, 0 rows are updated, and that
     is our "out of stock" signal.
     """
-    result = db.execute(
+    row = db.execute(
         update(Stock)
         .where(
             Stock.store_id == store_id,
@@ -62,13 +63,16 @@ def reserve_atomic(db: Session, store_id: int, sku: str, qty: int) -> None:
         )
         # Raw UPDATEs skip the ORM's onupdate, so set updated_at ourselves.
         .values(reserved=Stock.reserved + qty, updated_at=func.now())
+        # RETURNING hands back the new values in the same round trip.
+        .returning(Stock.on_hand, Stock.reserved)
         .execution_options(synchronize_session=False)
-    )
-    if result.rowcount == 0:
+    ).one_or_none()
+    if row is None:
         _raise_unavailable(db, store_id, sku, qty)
+    return row.on_hand, row.reserved
 
 
-def reserve_for_update(db: Session, store_id: int, sku: str, qty: int) -> None:
+def reserve_for_update(db: Session, store_id: int, sku: str, qty: int) -> tuple[int, int]:
     """Lock the row first (SELECT ... FOR UPDATE), then decide in Python.
 
     FOR UPDATE takes the row lock at read time, so any other transaction
@@ -96,6 +100,7 @@ def reserve_for_update(db: Session, store_id: int, sku: str, qty: int) -> None:
         .values(reserved=Stock.reserved + qty, updated_at=func.now())
         .execution_options(synchronize_session=False)
     )
+    return row.on_hand, row.reserved + qty
 
 
 STRATEGIES: dict[str, ReserveFn] = {

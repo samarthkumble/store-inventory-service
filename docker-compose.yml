@@ -1,4 +1,22 @@
-# One command runs everything:  docker compose up -d --build
+# One command runs everything:  docker compose up -d --build --wait
+#
+#   api (8000) --writes--> Postgres (stock + outbox)
+#   outbox-relay --reads outbox--> Redis Stream "stock-events"
+#   replenishment-consumer --reads stream--> Postgres (replenishment schema)
+#   replenishment (8001) --serves--> GET /reorder-suggestions
+
+# Settings shared by the 4 services that run this repo's code. They all use
+# ONE image, built once by the "api" service (building it once per service
+# would download every package 4 times over, in parallel).
+x-app: &app
+  image: store-inventory-app:local
+  pull_policy: never        # it's built locally, never pulled from a registry
+  environment:
+    # "db"/"redis", not "localhost": inside a container, localhost is the
+    # container itself. Compose gives each service a DNS name.
+    DATABASE_URL: postgresql+psycopg://inventory:inventory@db:5432/inventory
+    REDIS_URL: redis://redis:6379/0
+
 services:
   db:
     image: postgres:17-alpine
@@ -17,18 +35,27 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: inventory-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
-    build: .
+    <<: *app
+    build: .                 # the only service that builds the image
     container_name: inventory-api
-    environment:
-      # "db", not "localhost": inside a container, localhost is the container
-      # itself. Compose gives each service a DNS name on a shared network.
-      DATABASE_URL: postgresql+psycopg://inventory:inventory@db:5432/inventory
     ports:
       - "8000:8000"
     depends_on:
       db:
-        # Wait until Postgres actually accepts connections, not just "started".
+        condition: service_healthy   # wait for "accepting connections", not just "started"
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -36,6 +63,46 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  outbox-relay:
+    <<: *app
+    container_name: inventory-outbox-relay
+    command: ["python", "-m", "app.events.relay"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy   # the api container runs the migrations
+      redis:
+        condition: service_healthy
+
+  replenishment:
+    <<: *app
+    container_name: replenishment-api
+    command: ["uvicorn", "replenishment.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  replenishment-consumer:
+    <<: *app
+    container_name: replenishment-consumer
+    command: ["python", "-m", "replenishment.consumer"]
+    restart: unless-stopped
+    depends_on:
+      replenishment:
+        condition: service_healthy   # creates the replenishment schema on startup
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:

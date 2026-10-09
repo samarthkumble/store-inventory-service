@@ -5,7 +5,7 @@ responses through the handlers registered in main.py.
 """
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -41,8 +41,11 @@ def list_products(
 
 
 @router.get("/{sku}", response_model=ProductOut)
-def get_product(sku: SkuPath, db: DbSession):
-    return product_service.get_product(db, sku)
+def get_product(sku: SkuPath, db: DbSession, response: Response):
+    """Served from the Redis cache when possible. X-Cache shows HIT or MISS."""
+    product, hit = product_service.get_product_cached(db, sku)
+    response.headers["X-Cache"] = "HIT" if hit else "MISS"
+    return product
 
 
 @router.patch("/{sku}", response_model=ProductOut)

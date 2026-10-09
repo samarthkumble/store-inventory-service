@@ -19,5 +19,10 @@ class Settings(BaseSettings):
     # concurrency; see app/services/reservation.py for the trade-offs.
     reservation_strategy: Literal["atomic", "for_update"] = "atomic"
 
+    # Redis: the event stream (Milestone 4) and the product cache.
+    redis_url: str = "redis://localhost:6379/0"
+    stock_events_stream: str = "stock-events"
+    product_cache_ttl_seconds: int = 300
+
 
 settings = Settings()

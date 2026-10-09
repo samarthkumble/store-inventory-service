@@ -10,7 +10,7 @@ from app.core.exceptions import NotFoundError, OutOfStockError
 from app.models import Stock
 
 
-def reserve_naive(db: Session, store_id: int, sku: str, qty: int) -> None:
+def reserve_naive(db: Session, store_id: int, sku: str, qty: int) -> tuple[int, int]:
     stock = db.get(Stock, (store_id, sku))           # 1. READ  (no lock)
     if stock is None:
         raise NotFoundError(f"SKU {sku} is not stocked at store {store_id}")
@@ -22,3 +22,4 @@ def reserve_naive(db: Session, store_id: int, sku: str, qty: int) -> None:
     # If 5 requests all read reserved = 6, all 5 write 7. Four reservations
     # vanish (lost updates), all 5 customers get a 201, and the row still
     # looks perfectly legal, so no CHECK constraint can catch it.
+    return stock.on_hand, stock.reserved

@@ -4,9 +4,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.cache import cache_delete, cache_get, cache_set
+from app.core.config import settings
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models import Product
-from app.schemas.product import Category, ProductCreate, ProductUpdate
+from app.schemas.product import Category, ProductCreate, ProductOut, ProductUpdate
+
+
+def _cache_key(sku: str) -> str:
+    return f"product:{sku}"
 
 
 def create_product(db: Session, data: ProductCreate) -> Product:
@@ -33,6 +39,22 @@ def get_product(db: Session, sku: str) -> Product:
     return product
 
 
+def get_product_cached(db: Session, sku: str) -> tuple[ProductOut, bool]:
+    """Cache-aside read: try Redis, else load from Postgres and fill the cache.
+
+    Returns (product, cache_hit). Only found products are cached; a 404 is
+    never cached, so a product created a second later is visible immediately.
+    """
+    cached = cache_get(_cache_key(sku))
+    if cached is not None:
+        return ProductOut.model_validate_json(cached), True
+    product = ProductOut.model_validate(get_product(db, sku))
+    # The TTL is a safety net: even if an invalidation is ever missed,
+    # a stale entry lives at most this long.
+    cache_set(_cache_key(sku), product.model_dump_json(), settings.product_cache_ttl_seconds)
+    return product, False
+
+
 def list_products(
     db: Session, category: Category | None, limit: int, offset: int
 ) -> list[Product]:
@@ -51,6 +73,9 @@ def update_product(db: Session, sku: str, data: ProductUpdate) -> Product:
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(product, field, value)
     db.commit()
+    # Invalidate AFTER the commit. Deleting before it would let a concurrent
+    # read refill the cache with the old row before the new one is visible.
+    cache_delete(_cache_key(sku))
     return product
 
 
@@ -59,3 +84,4 @@ def delete_product(db: Session, sku: str) -> None:
     product = get_product(db, sku)
     product.is_active = False
     db.commit()
+    cache_delete(_cache_key(sku))

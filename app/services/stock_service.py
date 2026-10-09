@@ -1,8 +1,9 @@
 """Store-level reads: stock for one SKU, and product search inside a store."""
-from sqlalchemy import Row, func, select
+from sqlalchemy import Row, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError
+from app.events.outbox import record_stock_event
 from app.models import Product, Stock, Store
 from app.models.product import ENGLISH, PRODUCT_NAME_TSVECTOR
 from app.schemas.product import Category
@@ -45,6 +46,27 @@ def get_stock(db: Session, store_id: int, sku: str) -> Row:
     if row is None:
         raise NotFoundError(f"SKU {sku} is not stocked at store {store_id}")
     return row
+
+
+def receive_stock(db: Session, store_id: int, sku: str, qty: int) -> Row:
+    """A delivery arrived: add qty to on_hand (atomically) and emit RECEIVED."""
+    _ensure_store_exists(db, store_id)
+    try:
+        row = db.execute(
+            update(Stock)
+            .where(Stock.store_id == store_id, Stock.sku == sku)
+            .values(on_hand=Stock.on_hand + qty, updated_at=func.now())
+            .returning(Stock.on_hand, Stock.reserved)
+            .execution_options(synchronize_session=False)
+        ).one_or_none()
+        if row is None:
+            raise NotFoundError(f"SKU {sku} is not stocked at store {store_id}")
+        record_stock_event(db, "RECEIVED", store_id, sku, qty, row.on_hand, row.reserved)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return get_stock(db, store_id, sku)
 
 
 def search_products(

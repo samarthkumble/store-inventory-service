@@ -7,7 +7,11 @@ Both end states are final.
 Lock order rule (prevents deadlocks): every transaction that touches several
 rows locks them in the same global order: the order row first (if any),
 then stock rows sorted by SKU.
+
+Every stock change also records a StockChanged event in the outbox, in the
+SAME transaction, so events exist exactly for the changes that were committed.
 """
+import uuid
 from collections import defaultdict
 from uuid import UUID
 
@@ -15,6 +19,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import InvalidOrderStateError, NotFoundError
+from app.events.outbox import record_stock_event
 from app.models import Order, OrderItem, Product, Stock, Store
 from app.schemas.order import OrderCreate
 from app.services.reservation import ReserveFn
@@ -49,10 +54,15 @@ def create_order(db: Session, data: OrderCreate, reserve: ReserveFn) -> Order:
         if missing:
             raise NotFoundError(f"Unknown product(s): {', '.join(missing)}")
 
+        # Generated here (not by the database) so the events can include it.
+        order_id = uuid.uuid4()
         for sku in skus:
-            reserve(db, data.store_id, sku, quantities[sku])
+            on_hand, reserved = reserve(db, data.store_id, sku, quantities[sku])
+            record_stock_event(db, "RESERVED", data.store_id, sku, quantities[sku],
+                               on_hand, reserved, order_id)
 
         order = Order(
+            id=order_id,
             store_id=data.store_id,
             status="RESERVED",
             items=[
@@ -126,16 +136,19 @@ def _finish_order(db, order_id, new_status, verb, stock_change) -> Order:
             .order_by(OrderItem.sku)  # same lock order as create_order
         ).all()
         for sku, qty in items:
-            result = db.execute(
+            row = db.execute(
                 update(Stock)
                 .where(Stock.store_id == store_id, Stock.sku == sku)
                 .values(**stock_change(qty), updated_at=func.now())
+                .returning(Stock.on_hand, Stock.reserved)
                 .execution_options(synchronize_session=False)
-            )
-            if result.rowcount != 1:
+            ).one_or_none()
+            if row is None:
                 # Should be impossible: the reservation created this row's
                 # "reserved" units. Fail loudly instead of silently drifting.
                 raise RuntimeError(f"Stock row missing for {sku} at store {store_id}")
+            record_stock_event(db, new_status, store_id, sku, qty,
+                               row.on_hand, row.reserved, order_id)
         db.commit()
     except Exception:
         db.rollback()
