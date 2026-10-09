@@ -1,8 +1,8 @@
-fastapi
-uvicorn[standard]
-sqlalchemy>=2.0
-psycopg[binary]
-alembic
-pydantic-settings
-pytest
-httpx
+# Runtime dependencies: what the API needs in production (and in the Docker image).
+# Exact versions (==) so every machine installs exactly what the tests passed with.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.4
+psycopg[binary]==3.3.6
+alembic==1.20.0
+pydantic-settings==2.15.0

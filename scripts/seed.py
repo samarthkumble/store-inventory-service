@@ -138,7 +138,7 @@ CATALOG = {
 
 
 def retail_price(amount: float) -> Decimal:
-    """Round to a shelf-style price ending in 9, e.g. 1243.7 -> 1249.00."""
+    """Round to a shelf-style price ending in 9, e.g. 1243.7 -> 1239.00, 1247.0 -> 1249.00."""
     return Decimal(max(9, round(amount / 10) * 10 - 1)).quantize(Decimal("0.01"))
 
 

@@ -1,0 +1,14 @@
+[run]
+source = app, scripts
+# Also measure which if/else branches ran, not just which lines.
+branch = True
+# bench.py is a manual measurement tool that needs a running server,
+# not product code, so it isn't part of the coverage target.
+omit = scripts/bench.py
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:

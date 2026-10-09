@@ -1,0 +1,6 @@
+# Test and development tools. Not installed in the Docker image:
+# a smaller image starts faster and has fewer packages to patch.
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.1.0
+httpx2==2.13.0

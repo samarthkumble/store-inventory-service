@@ -1,3 +1,4 @@
+# One command runs everything:  docker compose up -d --build
 services:
   db:
     image: postgres:17-alpine
@@ -15,6 +16,26 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  api:
+    build: .
+    container_name: inventory-api
+    environment:
+      # "db", not "localhost": inside a container, localhost is the container
+      # itself. Compose gives each service a DNS name on a shared network.
+      DATABASE_URL: postgresql+psycopg://inventory:inventory@db:5432/inventory
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        # Wait until Postgres actually accepts connections, not just "started".
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata:

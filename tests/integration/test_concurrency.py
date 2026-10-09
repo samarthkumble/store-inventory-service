@@ -13,7 +13,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-import httpx
+import httpx2
 import pytest
 from sqlalchemy import func, select, text
 
@@ -32,7 +32,7 @@ def fire_simultaneously(url: str, bodies: list[dict]) -> tuple[Counter, list[flo
     gate = threading.Barrier(len(bodies))
 
     def one(body):
-        with httpx.Client(timeout=60) as http:
+        with httpx2.Client(timeout=60) as http:
             gate.wait()  # every thread waits here, then all are released together
             start = time.perf_counter()
             status = http.post(url, json=body).status_code
